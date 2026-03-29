@@ -1,0 +1,20 @@
+[package]
+name = "oxycrypt"
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+
+[dependencies]
+nbd = { path = "../crates/nbd" }
+
+clap = { version = "4.5.60", features = ["derive"] }
+color-eyre = "0.6.5"
+sudo2 = "0.2.1"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+tracing = {workspace = true}
+rustix = {workspace = true}

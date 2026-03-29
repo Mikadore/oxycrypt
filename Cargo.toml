@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/*",
+    "oxycrypt",
+]
+
+default-members = ["oxycrypt"]
+
+[workspace.package]
+version = "0.0.0"
+authors = ["Mikadore"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.96"
+description = "Mount encrypted files as block devices in userspace"
+
+
+[workspace.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "mm", "mount", "system", "process"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
