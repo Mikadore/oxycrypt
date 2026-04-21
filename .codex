@@ -1,0 +1,83 @@
+Project: Oxycrypt
+
+Purpose
+Oxycrypt is a Rust userspace block-device tool for Linux.
+Its practical goal is to provide an experience similar to
+`cryptsetup luksMount /dev/xyz name`, but without reimplementing the
+kernel-level device-mapper path.
+
+Instead of creating a device-mapper target or writing a kernel driver,
+Oxycrypt uses the in-tree Linux NBD driver and a Rust NBD server to expose
+storage controlled from userspace. The long-term plan is to serve a regular
+file as a virtual block device, then layer optional LUKS-compatible or
+LUKS-inspired encryption on top.
+
+Current State
+The repository currently contains the early NBD/device-management skeleton.
+The important implemented area is the Linux NBD plumbing: opening/configuring
+`/dev/nbdX`, ensuring the kernel module is available, and wiring up the basic
+mount/server flow.
+
+The project is not yet a complete usable encrypted disk-image tool.
+In particular, the file-backed block I/O layer is still the next major piece,
+and encryption is a later milestone rather than the immediate core behavior.
+
+Primary Near-Term Goal
+Finish a correct and understandable file-backed virtual block device over NBD.
+That means:
+- serve reads and writes against a regular file
+- define a clean block I/O abstraction
+- make the mount path work end-to-end
+- keep the implementation easy to reason about and debug
+
+Secondary Goals
+- add encryption support once the plain file-backed path is solid
+- support image metadata and inspection commands
+- eventually explore resizing and related disk-image management features
+
+Non-Goals For Now
+- do not try to reproduce Linux device-mapper internals
+- do not introduce kernel code or custom drivers
+- do not optimize for feature parity with `cryptsetup` before the core NBD
+  file-backed path is working
+
+Design Guidance
+- prefer a small number of clear layers:
+  CLI -> orchestration/mount flow -> NBD protocol/server -> backing storage
+  -> optional encryption/format logic
+- keep Linux/NBD-specific code isolated from future storage/encryption logic
+- prefer explicit, boring, debuggable code over clever abstractions
+- build the plain, unencrypted path first; encryption should fit on top of a
+  working storage abstraction rather than being baked into early plumbing
+- treat correctness of block semantics and error handling as more important
+  than premature performance work
+
+Implementation Priorities
+When making changes, optimize for the following order:
+1. end-to-end correctness
+2. simple architecture and maintainability
+3. good observability and diagnostics
+4. performance improvements where they do not obscure correctness
+
+Operational Assumptions
+- target platform is Linux
+- NBD is the kernel integration mechanism
+- root privileges may be required for mount/device operations
+- userspace control is a feature, not a temporary workaround
+
+Change Heuristics
+- changes that make the file-backed NBD path more complete are usually aligned
+  with project goals
+- changes that tighten the separation between transport, storage, and future
+  encryption layers are usually good
+- changes that push the project toward kernel-space complexity should be viewed
+  skeptically unless there is a very strong payoff
+
+Verification Expectations
+After meaningful changes, prefer verifying with the smallest useful step:
+- `cargo check`
+- targeted tests if present
+- manual validation of the NBD setup path when relevant
+
+If behavior is incomplete, preserve a path toward the intended architecture
+rather than papering over missing pieces with tightly coupled shortcuts.
