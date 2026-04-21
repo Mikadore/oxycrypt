@@ -1,4 +1,3 @@
-use std::os::fd::IntoRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -48,11 +47,7 @@ fn main() -> Result<()> {
         .init();
 
     let args = Cli::parse();
-
-    if args.command.need_root() {
-        sudo2::escalate_with_env().expect("Failed to relaunch with sudo");
-    }
-
+    
     info!("Starting up");
 
     match args.command {
@@ -62,15 +57,7 @@ fn main() -> Result<()> {
 }
 
 fn mount(file: &Path, target: &Path) -> Result<()> {
-    nbd::device::ensure_modprobe_nbd()?;
-    let (client, mut server) = nbd::server::NbdServer::new()?;
-    let mut dev = nbd::device::NbdDevice::open(0)?;
-    dev.set_size(1024, 1024)?;
-    dev.set_flags(nbd::proto::NbdDriverFlags::default())?;
-    dev.set_sock(client.into_raw_fd())?;
-    std::thread::spawn(move || {
-        dev.do_it().unwrap();
-    });
+    let server = nbd::server::NbdServer::mount(0, 1024, 1024)?;
     server.run()?;
     Ok(())
 }

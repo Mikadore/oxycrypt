@@ -2,7 +2,7 @@ use std::process::ExitStatus;
 
 use rootcause::Report;
 
-pub mod device;
+mod device;
 pub mod proto;
 pub mod server;
 

@@ -11,6 +11,7 @@ use rustix::ioctl::Opcode;
 use rustix::ioctl::ioctl;
 use rustix::ioctl::opcode::none as _IO;
 use rustix::path::Arg;
+use tracing::{debug, info};
 
 use crate::NbdError;
 use crate::Result;
@@ -35,9 +36,11 @@ const NBD_SET_SIZE: Opcode = _IO(0xab, 2);
 
 pub fn ensure_modprobe_nbd() -> Result<()> {
     if Path::new("/sys/block/nbd").exists() {
+        debug!("NBD kernel module already available");
         return Ok(());
     }
 
+    info!("Loading NBD kernel module with modprobe");
     let out = std::process::Command::new("modprobe")
         .arg("nbd")
         .output()
@@ -49,12 +52,14 @@ pub fn ensure_modprobe_nbd() -> Result<()> {
         let stderr = out.stderr.to_string_lossy().into();
         Err(NbdError::ModprobeFailure { stderr, status }.into())
     } else {
+        info!("Loaded NBD kernel module");
         Ok(())
     }
 }
 
 pub struct NbdDevice {
     device_fd: OwnedFd,
+    #[allow(unused)]
     socket_fd: Option<OwnedFd>,
 }
 
@@ -64,6 +69,7 @@ impl NbdDevice {
         // at startup. even when iterating over multiple possible devices
         // this should be negligible
         let path = format!("/dev/nbd{}", device);
+        debug!(device, path, "Opening NBD block device");
         let device_fd = rustix::fs::open(&path, OFlags::RDWR, 0.into())
             .map_err(NbdError::from)
             .attach("Failed to open NBD block device")?;
@@ -76,6 +82,7 @@ impl NbdDevice {
 
     // TODO: Precise errors
     pub fn set_size(&mut self, block_size: usize, block_count: usize) -> Result<()> {
+        debug!(block_size, block_count, "Configuring NBD device size");
         unsafe {
             ioctl(&self.device_fd, IntegerSetter::<NBD_SET_BLKSIZE>::new_usize(block_size))
                 .map_err(NbdError::from)
@@ -91,6 +98,7 @@ impl NbdDevice {
     }
 
     pub fn set_flags(&mut self, flags: NbdDriverFlags) -> Result<()> {
+        debug!(flags = flags.bits(), "Configuring NBD device flags");
         unsafe {
             ioctl(
                 &self.device_fd,
@@ -103,6 +111,7 @@ impl NbdDevice {
     }
 
     pub fn set_sock(&mut self, socket: RawFd) -> Result<()> {
+        debug!(fd = socket, "Attaching NBD socket to device");
         unsafe {
             ioctl(
                 &self.device_fd,
@@ -128,11 +137,13 @@ impl NbdDevice {
     }
 
     pub fn do_it(&mut self) -> Result<()> {
+        info!("Entering blocking NBD_DO_IT ioctl");
         unsafe {
             ioctl(&self.device_fd, NoArg::<NBD_DO_IT>::new())
                 .map_err(NbdError::from)
                 .attach("NBD_DO_IT ioctl")?;
         }
+        info!("NBD_DO_IT ioctl returned");
         Ok(())
     }
 
