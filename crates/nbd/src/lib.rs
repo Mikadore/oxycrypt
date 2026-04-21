@@ -11,6 +11,8 @@ pub mod server;
 pub enum NbdError {
     #[error("failed to modprobe the nbd driver({}): {}", .status, .stderr)]
     ModprobeFailure { stderr: String, status: ExitStatus },
+    #[error("NBD protocol error")]
+    Protocol,
     #[error("std i/o error: {}", .0)]
     StdIO(#[from] std::io::Error),
     #[error("linux i/o error: {}", .0)]

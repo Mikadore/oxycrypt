@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::Subcommand;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
@@ -52,6 +53,8 @@ fn main() -> Result<()> {
         sudo2::escalate_with_env().expect("Failed to relaunch with sudo");
     }
 
+    info!("Starting up");
+
     match args.command {
         Command::Mount { file, target } => mount(&file, &target),
         Command::Show { file } => Ok(()),
@@ -63,7 +66,7 @@ fn mount(file: &Path, target: &Path) -> Result<()> {
     let (client, mut server) = nbd::server::NbdServer::new()?;
     let mut dev = nbd::device::NbdDevice::open(0)?;
     dev.set_size(1024, 1024)?;
-    dev.set_flags(nbd::proto::NbdFlags::default())?;
+    dev.set_flags(nbd::proto::NbdDriverFlags::default())?;
     dev.set_sock(client.into_raw_fd())?;
     std::thread::spawn(move || {
         dev.do_it().unwrap();

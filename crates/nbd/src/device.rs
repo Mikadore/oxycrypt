@@ -14,7 +14,7 @@ use rustix::path::Arg;
 
 use crate::NbdError;
 use crate::Result;
-use crate::proto::NbdFlags;
+use crate::proto::NbdDriverFlags;
 
 const NBD_SET_SOCK: Opcode = _IO(0xab, 0);
 const NBD_SET_BLKSIZE: Opcode = _IO(0xab, 1);
@@ -90,7 +90,7 @@ impl NbdDevice {
         Ok(())
     }
 
-    pub fn set_flags(&mut self, flags: NbdFlags) -> Result<()> {
+    pub fn set_flags(&mut self, flags: NbdDriverFlags) -> Result<()> {
         unsafe {
             ioctl(
                 &self.device_fd,
