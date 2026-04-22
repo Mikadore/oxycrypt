@@ -16,5 +16,6 @@ color-eyre = "0.6.5"
 sudo2 = "0.2.1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
+tokio = { workspace = true }
 tracing = {workspace = true}
 rustix = {workspace = true}

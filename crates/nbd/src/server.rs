@@ -1,10 +1,11 @@
-use std::io::Read;
 use std::os::fd::IntoRawFd;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::{Arc, Barrier};
-use std::os::unix::net::UnixStream;
 
 use rootcause::prelude::ResultExt;
 use rootcause::report;
+use tokio::io::AsyncReadExt;
+use tokio::net::UnixStream;
 
 use crate::device;
 use crate::device::NbdDevice;
@@ -22,9 +23,16 @@ impl NbdServer {
     pub fn mount(device_index: usize, block_size: usize, block_count: usize) -> Result<Self> {
         device::ensure_modprobe_nbd()?;
 
-        let (client, server) = UnixStream::pair()
+        let (client, server) = StdUnixStream::pair()
             .map_err(NbdError::from)
             .attach("Failed to create NBD UnixStream pair")?;
+        server
+            .set_nonblocking(true)
+            .map_err(NbdError::from)
+            .attach("Failed to set NBD server socket nonblocking")?;
+        let server = UnixStream::from_std(server)
+            .map_err(NbdError::from)
+            .attach("Failed to convert NBD server socket to Tokio UnixStream")?;
 
         let mut device = NbdDevice::open(device_index)?;
         device.set_size(block_size, block_count)?;
@@ -34,17 +42,17 @@ impl NbdServer {
         Ok(Self { device, server })
     }
 
-    fn read_header_bytes(server: &mut UnixStream) -> Result<Option<[u8; 28]>> {
+    async fn read_header_bytes(server: &mut UnixStream) -> Result<Option<[u8; 28]>> {
         let mut buf = [0u8; 28];
 
-        match server.read_exact(&mut buf) {
-            Ok(()) => Ok(Some(buf)),
+        match server.read_exact(&mut buf).await {
+            Ok(_) => Ok(Some(buf)),
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(err) => Err(report!(NbdError::from(err)).context(NbdError::Protocol)),
         }
     }
 
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         let Self {
             mut device,
             mut server,
@@ -59,6 +67,7 @@ impl NbdServer {
         start_barrier.wait();
 
         while let Some(bytes) = Self::read_header_bytes(&mut server)
+            .await
             .attach("Failed to read from NBD server socket")?
         {
             let request = NbdRequest::from_bytes(&bytes)?;

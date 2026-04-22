@@ -3,12 +3,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::Subcommand;
+use nbd::Result;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
-
-use nbd::Result;
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -21,7 +20,7 @@ struct Cli {
 enum Command {
     Mount {
         #[arg(index = 1)]
-        file: PathBuf,
+        file:   PathBuf,
         #[arg(index = 2)]
         target: PathBuf,
     },
@@ -40,24 +39,25 @@ impl Command {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
 
     let args = Cli::parse();
-    
+
     info!("Starting up");
 
     match args.command {
-        Command::Mount { file, target } => mount(&file, &target),
+        Command::Mount { file, target } => mount(&file, &target).await,
         Command::Show { file } => Ok(()),
     }
 }
 
-fn mount(file: &Path, target: &Path) -> Result<()> {
+async fn mount(file: &Path, target: &Path) -> Result<()> {
     let server = nbd::server::NbdServer::mount(0, 1024, 1024)?;
-    server.run()?;
+    server.run().await?;
     Ok(())
 }
