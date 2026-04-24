@@ -11,7 +11,9 @@ use rustix::ioctl::Opcode;
 use rustix::ioctl::ioctl;
 use rustix::ioctl::opcode::none as _IO;
 use rustix::path::Arg;
-use tracing::{debug, info};
+use tracing::debug;
+use tracing::info;
+use tracing::trace;
 
 use crate::NbdError;
 use crate::Result;
@@ -21,6 +23,7 @@ const NBD_SET_SOCK: Opcode = _IO(0xab, 0);
 const NBD_SET_BLKSIZE: Opcode = _IO(0xab, 1);
 const NBD_DO_IT: Opcode = _IO(0xab, 3);
 const NBD_CLEAR_SOCK: Opcode = _IO(0xab, 4);
+const NBD_CLEAR_QUE: Opcode = _IO(0xab, 5);
 const NBD_SET_SIZE_BLOCKS: Opcode = _IO(0xab, 7);
 const NBD_DISCONNECT: Opcode = _IO(0xab, 8);
 const NBD_SET_TIMEOUT: Opcode = _IO(0xab, 9);
@@ -29,7 +32,6 @@ const NBD_SET_FLAGS: Opcode = _IO(0xab, 10);
 /*
 ioctl constants defined in the linux header, but not used by us:
 
-const NBD_CLEAR_QUE: Opcode = _IO(0xab, 5);
 const NBD_PRINT_DEBUG: Opcode = _IO(0xab, 6);
 const NBD_SET_SIZE: Opcode = _IO(0xab, 2);
 */
@@ -137,13 +139,13 @@ impl NbdDevice {
     }
 
     pub fn do_it(&mut self) -> Result<()> {
-        info!("Entering blocking NBD_DO_IT ioctl");
+        trace!("Entering blocking NBD_DO_IT ioctl");
         unsafe {
             ioctl(&self.device_fd, NoArg::<NBD_DO_IT>::new())
                 .map_err(NbdError::from)
                 .attach("NBD_DO_IT ioctl")?;
         }
-        info!("NBD_DO_IT ioctl returned");
+        trace!("NBD_DO_IT ioctl returned");
         Ok(())
     }
 
@@ -164,6 +166,15 @@ impl NbdDevice {
         }
         // Drop the OwnedFd if it exists
         let _ = self.socket_fd.take();
+        Ok(())
+    }
+
+    pub fn clear_queue(&mut self) -> Result<()> {
+        unsafe {
+            ioctl(&self.device_fd, NoArg::<NBD_CLEAR_QUE>::new())
+                .map_err(NbdError::from)
+                .attach("NBD_CLEAR_QUE ioctl")?;
+        }
         Ok(())
     }
     /*

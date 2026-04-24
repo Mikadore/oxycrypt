@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use clap::Subcommand;
 use nbd::Result;
+use tokio::signal;
+use tracing::error;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
@@ -30,15 +32,6 @@ enum Command {
     },
 }
 
-impl Command {
-    fn need_root(&self) -> bool {
-        match self {
-            Self::Mount { .. } => true,
-            Self::Show { .. } => false,
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -52,12 +45,28 @@ async fn main() -> Result<()> {
 
     match args.command {
         Command::Mount { file, target } => mount(&file, &target).await,
-        Command::Show { file } => Ok(()),
+        Command::Show { file: _ } => Ok(()),
     }
 }
 
-async fn mount(file: &Path, target: &Path) -> Result<()> {
+async fn mount(_file: &Path, _target: &Path) -> Result<()> {
     let server = nbd::server::NbdServer::mount(0, 1024, 1024)?;
-    server.run().await?;
-    Ok(())
+    let mut controller = server.run();
+
+    signal::ctrl_c().await.map_err(nbd::NbdError::from)?;
+    info!("Received shutdown signal");
+
+    controller.stop().map_err(|err| {
+        nbd::NbdError::from(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("failed to send stop command: {err}"),
+        ))
+    })?;
+
+    let server_result = (&mut controller.handle).await.map_err(nbd::NbdError::from)?;
+    match &server_result {
+        Ok(()) => info!("Server task completed successfully"),
+        Err(err) => error!(error = %err, "Server task completed with error"),
+    }
+    server_result
 }
