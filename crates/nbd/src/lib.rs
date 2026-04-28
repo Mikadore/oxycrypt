@@ -2,13 +2,18 @@ use std::process::ExitStatus;
 
 use rootcause::Report;
 
-mod device;
+mod kernel_device;
 pub mod proto;
 pub mod server;
+pub mod session;
+
+pub use kernel_device::ensure_modprobe_nbd;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NbdError {
+    #[error("invalid device configuration: {0}")]
+    InvalidDeviceConfiguration(String),
     #[error("failed to modprobe the nbd driver({}): {}", .status, .stderr)]
     ModprobeFailure { stderr: String, status: ExitStatus },
     #[error("NBD protocol error")]

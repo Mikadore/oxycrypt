@@ -1,16 +1,15 @@
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
-use std::os::fd::RawFd;
 use std::path::Path;
 
 use rootcause::prelude::ResultExt;
+use rootcause::report;
 use rustix::fs::OFlags;
 use rustix::ioctl::IntegerSetter;
 use rustix::ioctl::NoArg;
 use rustix::ioctl::Opcode;
 use rustix::ioctl::ioctl;
 use rustix::ioctl::opcode::none as _IO;
-use rustix::path::Arg;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
@@ -26,15 +25,7 @@ const NBD_CLEAR_SOCK: Opcode = _IO(0xab, 4);
 const NBD_CLEAR_QUE: Opcode = _IO(0xab, 5);
 const NBD_SET_SIZE_BLOCKS: Opcode = _IO(0xab, 7);
 const NBD_DISCONNECT: Opcode = _IO(0xab, 8);
-const NBD_SET_TIMEOUT: Opcode = _IO(0xab, 9);
 const NBD_SET_FLAGS: Opcode = _IO(0xab, 10);
-
-/*
-ioctl constants defined in the linux header, but not used by us:
-
-const NBD_PRINT_DEBUG: Opcode = _IO(0xab, 6);
-const NBD_SET_SIZE: Opcode = _IO(0xab, 2);
-*/
 
 pub fn ensure_modprobe_nbd() -> Result<()> {
     if Path::new("/sys/block/nbd").exists() {
@@ -51,7 +42,7 @@ pub fn ensure_modprobe_nbd() -> Result<()> {
 
     let status = out.status;
     if !status.success() {
-        let stderr = out.stderr.to_string_lossy().into();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         Err(NbdError::ModprobeFailure { stderr, status }.into())
     } else {
         info!("Loaded NBD kernel module");
@@ -59,17 +50,13 @@ pub fn ensure_modprobe_nbd() -> Result<()> {
     }
 }
 
-pub struct NbdDevice {
+pub struct NbdKernelDevice {
     device_fd: OwnedFd,
-    #[allow(unused)]
     socket_fd: Option<OwnedFd>,
 }
 
-impl NbdDevice {
+impl NbdKernelDevice {
     pub fn open(device: usize) -> Result<Self> {
-        // this is not very nice, but opening the device is done only once
-        // at startup. even when iterating over multiple possible devices
-        // this should be negligible
         let path = format!("/dev/nbd{}", device);
         debug!(device, path, "Opening NBD block device");
         let device_fd = rustix::fs::open(&path, OFlags::RDWR, 0.into())
@@ -82,8 +69,12 @@ impl NbdDevice {
         })
     }
 
-    // TODO: Precise errors
-    pub fn set_size(&mut self, block_size: usize, block_count: usize) -> Result<()> {
+    pub fn set_size(&mut self, block_size: u32, block_count: u64) -> Result<()> {
+        let block_size = usize::try_from(block_size)
+            .map_err(|_| report!(NbdError::InvalidDeviceConfiguration("block size exceeds usize".into())))?;
+        let block_count = usize::try_from(block_count)
+            .map_err(|_| report!(NbdError::InvalidDeviceConfiguration("block count exceeds usize".into())))?;
+
         debug!(block_size, block_count, "Configuring NBD device size");
         unsafe {
             ioctl(&self.device_fd, IntegerSetter::<NBD_SET_BLKSIZE>::new_usize(block_size))
@@ -112,8 +103,8 @@ impl NbdDevice {
         Ok(())
     }
 
-    pub fn set_sock(&mut self, socket: RawFd) -> Result<()> {
-        debug!(fd = socket, "Attaching NBD socket to device");
+    pub fn set_sock(&mut self, socket: OwnedFd) -> Result<()> {
+        debug!(fd = socket.as_raw_fd(), "Attaching NBD socket to device");
         unsafe {
             ioctl(
                 &self.device_fd,
@@ -122,19 +113,7 @@ impl NbdDevice {
             .map_err(NbdError::from)
             .attach("NBD_SET_SOCK ioctl")?;
         }
-        //self.socket_fd = Some(socket);
-        Ok(())
-    }
-
-    pub fn set_timeout(&mut self, timeout_seconds: usize) -> Result<()> {
-        unsafe {
-            ioctl(
-                &self.device_fd,
-                IntegerSetter::<NBD_SET_TIMEOUT>::new_usize(timeout_seconds),
-            )
-            .map_err(NbdError::from)
-            .attach("NBD_SET_TIMEOUT ioctl")?;
-        }
+        self.socket_fd = Some(socket);
         Ok(())
     }
 
@@ -164,7 +143,6 @@ impl NbdDevice {
                 .map_err(NbdError::from)
                 .attach("NBD_CLEAR_SOCK ioctl")?;
         }
-        // Drop the OwnedFd if it exists
         let _ = self.socket_fd.take();
         Ok(())
     }
@@ -177,10 +155,4 @@ impl NbdDevice {
         }
         Ok(())
     }
-    /*
-    pub fn open_any() -> Result<Self> {
-        let nbds_max: usize = std::fs::read_to_string("/sys/module/nbd/parameters/nbds_max")?.trim().parse().expect("");
-    } */
 }
-
-// TODO: Maybe implement Drop?

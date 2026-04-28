@@ -1,21 +1,21 @@
+use std::io;
+
+use block_device::DeviceInfo;
 use enumflags2::BitFlag;
 use enumflags2::BitFlags;
 use enumflags2::bitflags;
-use packed_struct::prelude::*;
-use rootcause::prelude::ResultExt;
 use rootcause::report;
+use rustix::io::Errno;
 
 use crate::NbdError;
 use crate::Result;
 
-const NBD_REQUEST_MAGIC: u32 = 0x25609513;
-const NBD_REPLY_MAGIC: u32 = 0x67446698;
-const NBD_COMMAND_MASK: u32 = 0x0000_FFFF;
-const NBD_COMMAND_FLAG_SHIFT: u32 = 16;
+pub(crate) const NBD_REQUEST_MAGIC: u32 = 0x2560_9513;
+pub(crate) const NBD_SIMPLE_REPLY_MAGIC: u32 = 0x6744_6698;
 
-#[bitflags(default = HasFlags | SendFlush)]
+#[bitflags]
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NbdDriverFlag {
     HasFlags        = 1 << 0, /* nbd-server supports flags */
     ReadOnly        = 1 << 1, /* device is read-only */
@@ -28,6 +28,32 @@ pub enum NbdDriverFlag {
 }
 
 pub type NbdDriverFlags = BitFlags<NbdDriverFlag>;
+
+pub fn driver_flags_from_device_info(info: DeviceInfo) -> NbdDriverFlags {
+    let mut flags = NbdDriverFlags::empty();
+    flags.insert(NbdDriverFlag::HasFlags);
+
+    if info.read_only {
+        flags.insert(NbdDriverFlag::ReadOnly);
+    }
+    if info.supports_flush {
+        flags.insert(NbdDriverFlag::SendFlush);
+    }
+    if info.supports_fua {
+        flags.insert(NbdDriverFlag::SendFua);
+    }
+    if info.supports_trim {
+        flags.insert(NbdDriverFlag::SendTrim);
+    }
+    if info.supports_write_zeroes {
+        flags.insert(NbdDriverFlag::SendWriteZeroes);
+    }
+    if info.can_multi_conn {
+        flags.insert(NbdDriverFlag::CanMultiConn);
+    }
+
+    flags
+}
 
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,28 +90,7 @@ pub enum NbdCommandFlag {
 
 pub type NbdCommandFlags = BitFlags<NbdCommandFlag>;
 
-#[derive(PackedStruct, Debug, Clone)]
-#[packed_struct(endian = "msb")]
-struct NbdRequestHeader {
-    /// Always 0x25609513
-    pub magic:          u32,
-    pub type_and_flags: u32,
-    pub cookie:         u64,
-    pub offset:         u64,
-    pub length:         u32,
-}
-
-impl NbdRequestHeader {
-    fn command(&self) -> Option<NbdCommandType> {
-        NbdCommandType::from_raw((self.type_and_flags & NBD_COMMAND_MASK) as u16)
-    }
-
-    fn flags(&self) -> NbdCommandFlags {
-        NbdCommandFlag::from_bits_truncate((self.type_and_flags >> NBD_COMMAND_FLAG_SHIFT) as u16)
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NbdRequest {
     pub typ:          NbdCommandType,
     pub flag_fua:     bool,
@@ -98,41 +103,149 @@ pub struct NbdRequest {
 impl NbdRequest {
     pub const HEADER_LEN: usize = 28;
 
-    // bytes must be at least 28 bytes long
     pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
-        let header = NbdRequestHeader::unpack_from_slice(&bytes[..Self::HEADER_LEN])
-            .context(NbdError::Protocol)
-            .attach("Invalid request header")?;
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(report!(NbdError::Protocol).attach("request header is too short"));
+        }
 
-        if header.magic != NBD_REQUEST_MAGIC {
+        if read_u32(&bytes[0..4]) != NBD_REQUEST_MAGIC {
             return Err(report!(NbdError::Protocol).attach("invalid request magic"));
         }
 
-        let typ = header.command().ok_or_else(|| {
-            report!(NbdError::Protocol).attach(format!(
-                "invalid command type '{}'",
-                header.type_and_flags & NBD_COMMAND_MASK
-            ))
-        })?;
-
-        let flags = header.flags();
+        let flags = NbdCommandFlag::from_bits_truncate(read_u16(&bytes[4..6]));
+        let typ_raw = read_u16(&bytes[6..8]);
+        let typ = NbdCommandType::from_raw(typ_raw)
+            .ok_or_else(|| report!(NbdError::Protocol).attach(format!("invalid command type '{}'", typ_raw)))?;
 
         Ok(NbdRequest {
             typ,
-            flag_fua: flags.contains(NbdCommandFlag::NoHole),
-            flag_no_hole: flags.contains(NbdCommandFlag::Fua),
-            cookie: header.cookie,
-            offset: header.offset,
-            length: header.length,
+            flag_fua: flags.contains(NbdCommandFlag::Fua),
+            flag_no_hole: flags.contains(NbdCommandFlag::NoHole),
+            cookie: read_u64(&bytes[8..16]),
+            offset: read_u64(&bytes[16..24]),
+            length: read_u32(&bytes[24..28]),
         })
+    }
+
+    pub fn expects_write_payload(&self) -> bool {
+        matches!(self.typ, NbdCommandType::Write)
     }
 }
 
-#[derive(PackedStruct, Debug, Clone)]
-#[packed_struct(endian = "msb")]
-pub struct ReplyHeader {
-    pub magic:  u32,
-    pub error:  u32,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimpleReply {
     pub cookie: u64,
+    pub error:  u32,
+    pub data:   Vec<u8>,
+}
+
+impl SimpleReply {
+    pub fn ok(cookie: u64) -> Self {
+        Self {
+            cookie,
+            error: 0,
+            data: Vec::new(),
+        }
+    }
+
+    pub fn with_data(cookie: u64, data: Vec<u8>) -> Self {
+        Self { cookie, error: 0, data }
+    }
+
+    pub fn from_errno(cookie: u64, errno: Errno) -> Self {
+        Self {
+            cookie,
+            error: errno.raw_os_error() as u32,
+            data: Vec::new(),
+        }
+    }
+
+    pub fn from_io_error(cookie: u64, error: &io::Error) -> Self {
+        Self {
+            cookie,
+            error: io_error_to_reply_code(error),
+            data: Vec::new(),
+        }
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16 + self.data.len());
+        bytes.extend_from_slice(&NBD_SIMPLE_REPLY_MAGIC.to_be_bytes());
+        bytes.extend_from_slice(&self.error.to_be_bytes());
+        bytes.extend_from_slice(&self.cookie.to_be_bytes());
+        bytes.extend_from_slice(&self.data);
+        bytes
+    }
+}
+
+pub fn io_error_to_reply_code(error: &io::Error) -> u32 {
+    if let Some(code) = error.raw_os_error() {
+        return code.unsigned_abs();
+    }
+
+    match error.kind() {
+        io::ErrorKind::InvalidInput => Errno::INVAL.raw_os_error() as u32,
+        io::ErrorKind::PermissionDenied => Errno::PERM.raw_os_error() as u32,
+        io::ErrorKind::NotFound => Errno::NOENT.raw_os_error() as u32,
+        io::ErrorKind::Unsupported => Errno::OPNOTSUPP.raw_os_error() as u32,
+        _ => Errno::IO.raw_os_error() as u32,
+    }
+}
+
+fn read_u16(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes(bytes.try_into().expect("slice length should be validated"))
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes.try_into().expect("slice length should be validated"))
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(bytes.try_into().expect("slice length should be validated"))
+}
+
+#[cfg(test)]
+mod tests {
+    use block_device::DeviceGeometry;
+
+    use super::NbdCommandFlag;
+    use super::NbdCommandType;
+    use super::NbdDriverFlag;
+    use super::NbdRequest;
+    use super::driver_flags_from_device_info;
+    use super::*;
+
+    #[test]
+    fn parses_fua_and_no_hole_flags_correctly() {
+        let mut bytes = [0u8; NbdRequest::HEADER_LEN];
+        bytes[0..4].copy_from_slice(&NBD_REQUEST_MAGIC.to_be_bytes());
+
+        let flags = (NbdCommandFlag::Fua as u16) | (NbdCommandFlag::NoHole as u16);
+        bytes[4..6].copy_from_slice(&flags.to_be_bytes());
+        bytes[6..8].copy_from_slice(&(NbdCommandType::WriteZeroes as u16).to_be_bytes());
+        bytes[8..16].copy_from_slice(&123u64.to_be_bytes());
+        bytes[16..24].copy_from_slice(&4096u64.to_be_bytes());
+        bytes[24..28].copy_from_slice(&512u32.to_be_bytes());
+
+        let request = NbdRequest::from_bytes(bytes).expect("request should parse");
+        assert!(request.flag_fua);
+        assert!(request.flag_no_hole);
+    }
+
+    #[test]
+    fn derives_driver_flags_from_device_capabilities() {
+        let mut info = DeviceInfo::from_geometry(DeviceGeometry::new(512, 8));
+        info.read_only = true;
+        info.supports_flush = true;
+        info.supports_fua = true;
+        info.can_multi_conn = false;
+
+        let flags = driver_flags_from_device_info(info);
+        assert!(flags.contains(NbdDriverFlag::HasFlags));
+        assert!(flags.contains(NbdDriverFlag::ReadOnly));
+        assert!(flags.contains(NbdDriverFlag::SendFlush));
+        assert!(flags.contains(NbdDriverFlag::SendFua));
+        assert!(!flags.contains(NbdDriverFlag::CanMultiConn));
+    }
 }

@@ -1,24 +1,25 @@
-use std::os::fd::IntoRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::thread;
 
+use block_device::BlockDevice;
+use block_device::BuiltDevice;
+use block_device::DeviceGeometry;
 use rootcause::prelude::ResultExt;
 use rootcause::report;
-use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::info;
 use tracing::trace;
 
 use crate::NbdError;
 use crate::Result;
-use crate::device;
-use crate::device::NbdDevice;
-use crate::proto::NbdDriverFlags;
-use crate::proto::NbdRequest;
+use crate::kernel_device;
+use crate::kernel_device::NbdKernelDevice;
+use crate::proto::driver_flags_from_device_info;
+use crate::session::NbdSession;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Command {
@@ -36,15 +37,23 @@ impl NbdServerController {
     }
 }
 
-pub struct NbdServer {
-    device:         NbdDevice,
-    control_device: NbdDevice,
-    server:         UnixStream,
+pub struct NbdServer<D> {
+    device:         NbdKernelDevice,
+    control_device: NbdKernelDevice,
+    session:        NbdSession<D, UnixStream>,
 }
 
-impl NbdServer {
-    pub fn mount(device_index: usize, block_size: usize, block_count: usize) -> Result<Self> {
-        device::ensure_modprobe_nbd()?;
+impl<D> NbdServer<D>
+where
+    D: BlockDevice,
+{
+    pub fn mount(device_index: usize, built_device: BuiltDevice<D>) -> Result<Self> {
+        kernel_device::ensure_modprobe_nbd()?;
+
+        let geometry = built_device.geometry();
+        let (backend, block_size, block_count) = built_device.into_parts();
+        let backend = Arc::new(backend);
+        validate_geometry(geometry, backend.info())?;
 
         let (client, server) = StdUnixStream::pair()
             .map_err(NbdError::from)
@@ -57,30 +66,21 @@ impl NbdServer {
             .map_err(NbdError::from)
             .attach("Failed to convert NBD server socket to Tokio UnixStream")?;
 
-        let mut device = NbdDevice::open(device_index)?;
-        let control_device = NbdDevice::open(device_index)?;
+        let mut device = NbdKernelDevice::open(device_index)?;
+        let control_device = NbdKernelDevice::open(device_index)?;
         device.set_size(block_size, block_count)?;
-        device.set_flags(NbdDriverFlags::default())?;
-        device.set_sock(client.into_raw_fd())?;
+        device.set_flags(driver_flags_from_device_info(backend.info()))?;
+        let client: OwnedFd = client.into();
+        device.set_sock(client)?;
 
         Ok(Self {
             device,
             control_device,
-            server,
+            session: NbdSession::new(server, backend),
         })
     }
 
-    async fn read_header_bytes(server: &mut UnixStream) -> Result<Option<[u8; 28]>> {
-        let mut buf = [0u8; 28];
-
-        match server.read_exact(&mut buf).await {
-            Ok(_) => Ok(Some(buf)),
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-            Err(err) => Err(report!(NbdError::from(err)).context(NbdError::Protocol)),
-        }
-    }
-
-    fn shutdown(mut control_device: NbdDevice, do_it_thread: thread::JoinHandle<Result<()>>) -> Result<()> {
+    fn shutdown(mut control_device: NbdKernelDevice, do_it_thread: thread::JoinHandle<Result<()>>) -> Result<()> {
         // Tear down the kernel-side NBD state before joining the DO_IT thread.
         // The ioctl can return before that thread has fully unwound, and joining
         // first can deadlock waiting on cleanup that NBD_CLEAR_SOCK must trigger.
@@ -115,7 +115,7 @@ impl NbdServer {
             let Self {
                 device,
                 control_device,
-                mut server,
+                session,
             } = self;
             let start_barrier = Arc::new(Barrier::new(2));
             let do_it_barrier = Arc::clone(&start_barrier);
@@ -127,32 +127,18 @@ impl NbdServer {
             });
             start_barrier.wait();
 
-            let loop_result = loop {
-                tokio::select! {
-                    biased;
-
-                    command = command_rx.recv() => match command {
+            let session_result = session
+                .run_until(async move {
+                    match command_rx.recv().await {
                         Some(Command::Stop) | None => {
                             trace!("shutdown command received by server loop");
-                            break Ok(())
-                        },
-                    },
-                    bytes = Self::read_header_bytes(&mut server) => {
-                        let Some(bytes) = bytes
-                            .attach("Failed to read from NBD server socket")?
-                        else {
-                            break Ok(());
-                        };
-                        let request = NbdRequest::from_bytes(&bytes)?;
-                        info!("Read: {:?}", request);
+                        }
                     }
-                }
-            };
-
-            drop(server);
+                })
+                .await;
 
             let shutdown_result = Self::shutdown(control_device, do_it_thread);
-            match loop_result {
+            match session_result {
                 Ok(()) => shutdown_result,
                 Err(err) => {
                     let _ = shutdown_result;
@@ -163,4 +149,32 @@ impl NbdServer {
 
         NbdServerController { commands, handle }
     }
+}
+
+fn validate_geometry(geometry: DeviceGeometry, info: block_device::DeviceInfo) -> Result<()> {
+    if geometry.block_size == 0 {
+        return Err(report!(NbdError::InvalidDeviceConfiguration(
+            "block size must be greater than zero".into()
+        )));
+    }
+
+    if geometry.block_count == 0 {
+        return Err(report!(NbdError::InvalidDeviceConfiguration(
+            "block count must be greater than zero".into()
+        )));
+    }
+
+    if info.block_size != geometry.block_size {
+        return Err(report!(NbdError::InvalidDeviceConfiguration(
+            "device info block size does not match builder geometry".into()
+        )));
+    }
+
+    if info.size_bytes != geometry.size_bytes() {
+        return Err(report!(NbdError::InvalidDeviceConfiguration(
+            "device info size does not match builder geometry".into()
+        )));
+    }
+
+    Ok(())
 }

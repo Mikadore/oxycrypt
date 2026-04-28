@@ -1,0 +1,11 @@
+[package]
+name = "device-mem"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+block-device = { path = "../block-device" }
+rustix = { workspace = true }
